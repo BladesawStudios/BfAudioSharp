@@ -16,4 +16,8 @@
     <InternalsVisibleTo Include="BfAudioSharp.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Concentus" Version="2.2.2" />
+  </ItemGroup>
+
 </Project>

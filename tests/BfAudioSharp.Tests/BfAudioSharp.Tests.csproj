@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Concentus" Version="2.2.2" />
     <ProjectReference Include="..\..\src\BfAudioSharp\BfAudioSharp.csproj" />
   </ItemGroup>
 

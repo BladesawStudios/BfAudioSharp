@@ -129,12 +129,12 @@ public class BwavTests
     }
 
     [Fact]
-    public void AnOpusBwavIsReportedAsUnsupported()
+    public void AnOpusChannelWithoutItsHeaderIsRejected()
     {
         byte[] bwav = Bwav.Build([Tone(100, 3)], 32000);
         BinaryPrimitives.WriteUInt16LittleEndian(bwav.AsSpan(0x10), (ushort)BwavCodec.Opus);
 
-        Assert.Throws<NotSupportedException>(() => Bwav.Decode(bwav));
+        Assert.Throws<InvalidDataException>(() => Bwav.Decode(bwav));
     }
 
     [Fact]

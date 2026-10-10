@@ -74,8 +74,7 @@ public static class Bwav
     // ---- decoding ----
 
     /// <summary>
-    /// Decodes every channel of a PCM16 or DSP-ADPCM BWAV (as stored, a prefetch clip giving the samples it holds).
-    /// Opus BWAVs are not supported.
+    /// Decodes every channel of a PCM16, DSP-ADPCM or Opus BWAV (as stored, a prefetch clip giving the samples it holds).
     /// </summary>
     public static PcmAudio Decode(ReadOnlySpan<byte> data)
     {
@@ -128,8 +127,14 @@ public static class Bwav
                     for (int i = 0; i < samples; i++) pcm[i] = BinaryPrimitives.ReadInt16LittleEndian(data[(offset + i * 2)..]);
                     break;
                 }
+                case BwavCodec.Opus:
+                {
+                    if (offset < 0 || offset >= data.Length) throw new InvalidDataException($"Channel {c} reaches past the end of the file.");
+                    pcm = OpusChannel.Decode(data[offset..], samples);
+                    break;
+                }
                 default:
-                    throw new NotSupportedException($"BWAV codec {codec} is not supported (only PCM16 and DSP-ADPCM).");
+                    throw new NotSupportedException($"BWAV codec {codec} is not supported.");
             }
             audio.Channels[c] = pcm;
         }
