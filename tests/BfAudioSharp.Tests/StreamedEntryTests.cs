@@ -128,6 +128,47 @@ public class StreamedEntryTests
     }
 
     [Fact]
+    public void StereoGoesToTheFrontPairOfASurroundLayout()
+    {
+        short[] l = Tone(1000, 7), r = Tone(1000, 11);
+        short[][] six = Bwav.MatchSpeakerLayout([l, r], 6, [0, 1, 2, 3, 4, 5]);
+
+        Assert.Equal(6, six.Length);
+        Assert.Equal(l, six[0]);
+        Assert.Equal(r, six[1]);
+        Assert.All(six[2..], c => Assert.All(c, s => Assert.Equal(0, s)));
+
+        short[][] rearsFirst = Bwav.MatchSpeakerLayout([l, r], 4, [4, 5, 0, 1]);
+        Assert.Equal(l, rearsFirst[2]);
+        Assert.Equal(r, rearsFirst[3]);
+        Assert.All(rearsFirst[..2], c => Assert.All(c, s => Assert.Equal(0, s)));
+    }
+
+    [Fact]
+    public void MonoGoesToTheCentreOrBothFronts()
+    {
+        short[] m = Tone(1000, 7);
+        short[][] withCentre = Bwav.MatchSpeakerLayout([m], 6, [0, 1, 2, 3, 4, 5]);
+        Assert.Equal(m, withCentre[2]);
+        Assert.Equal(1, withCentre.Count(c => c.Any(s => s != 0)));
+
+        short[][] noCentre = Bwav.MatchSpeakerLayout([m], 4, [0, 1, 4, 5]);
+        Assert.Equal(m, noCentre[0]);
+        Assert.Equal(m, noCentre[1]);
+        Assert.All(noCentre[2..], c => Assert.All(c, s => Assert.Equal(0, s)));
+    }
+
+    [Fact]
+    public void LayeredLayoutsAndUnknownLayoutsKeepTheOldRemix()
+    {
+        short[] l = Tone(1000, 7), r = Tone(1000, 11);
+        Assert.Equal(Bwav.MatchChannelCount([l, r], 4), Bwav.MatchSpeakerLayout([l, r], 4, [0, 1, 0, 1]));
+        Assert.Equal(Bwav.MatchChannelCount([l, r], 6), Bwav.MatchSpeakerLayout([l, r], 6, null));
+        Assert.Equal(Bwav.MatchChannelCount([l, r], 1), Bwav.MatchSpeakerLayout([l, r], 1, [2]));
+        Assert.Equal(Bwav.MatchChannelCount([l, r], 6), Bwav.MatchSpeakerLayout([l, r], 6, [2, 3, 4, 5, 6, 7]));
+    }
+
+    [Fact]
     public void SpeakerPositionsAreWrittenAsGivenOrDefaultedByLayout()
     {
         short[] t = Tone(1000, 7);

@@ -471,6 +471,36 @@ public static class Bwav
         return output;
     }
 
+    public static short[][] MatchSpeakerLayout(short[][] channels, int target, ushort[]? pans)
+    {
+        int source = channels.Length;
+        if (pans is null || pans.Length != target || target <= source || source > 2 || pans.Distinct().Count() != pans.Length)
+            return MatchChannelCount(channels, target);
+
+        int left = Array.IndexOf(pans, (ushort)0), right = Array.IndexOf(pans, (ushort)1), centre = Array.IndexOf(pans, (ushort)2);
+        int samples = channels[0].Length;
+        short[][] output = [.. Enumerable.Range(0, target).Select(_ => new short[samples])];
+        if (source == 2 && left >= 0 && right >= 0)
+        {
+            output[left] = (short[])channels[0].Clone();
+            output[right] = (short[])channels[1].Clone();
+        }
+        else if (source == 1 && centre >= 0)
+        {
+            output[centre] = (short[])channels[0].Clone();
+        }
+        else if (source == 1 && left >= 0 && right >= 0)
+        {
+            output[left] = (short[])channels[0].Clone();
+            output[right] = (short[])channels[0].Clone();
+        }
+        else
+        {
+            return MatchChannelCount(channels, target);
+        }
+        return output;
+    }
+
     /// <summary>
     /// A copy with the loop set on every channel. A null <paramref name="loopStart"/> clears it; an end past the sample
     /// count is cut back to it, and an empty range clears the loop.
