@@ -25,7 +25,7 @@ public class BarsTests
     }
 
     // BARS: header, hashes, pairs, AMTAs, then each BWAV at a 0x40 boundary. A null BWAV means stream-only.
-    private static byte[] Bars(params (string Name, byte[]? Bwav)[] entries)
+    internal static byte[] Bars(params (string Name, byte[]? Bwav)[] entries)
     {
         int count = entries.Length;
         int amtaStart = 0x10 + count * 12;

@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using Concentus;
+using Concentus.Enums;
 
 namespace BfAudioSharp;
 
@@ -121,6 +123,7 @@ public static class Bwav
                     break;
                 }
                 case BwavCodec.Pcm16:
+                case BwavCodec.Opus when IsPrefetch(data):
                 {
                     long length = samples * 2L;
                     if (offset < 0 || offset + length > data.Length) throw new InvalidDataException($"Channel {c} reaches past the end of the file.");
@@ -148,15 +151,58 @@ public static class Bwav
     private static ushort[] Pans(int count) => count switch
     {
         1 => [2],
-        2 => [0, 1],
-        _ => [.. Enumerable.Repeat((ushort)2, count)],
+        6 => [0, 1, 2, 3, 4, 5],
+        _ => [.. Enumerable.Range(0, count).Select(i => (ushort)(i % 2))],
     };
 
-    /// <summary>
-    /// Encodes PCM to a whole (non-prefetch) DSP-ADPCM BWAV. The loop is dropped unless it is a non-empty range;
-    /// an end past the audio is cut back to its end.
-    /// </summary>
-    public static byte[] Build(short[][] channels, int sampleRate, int? loopStart = null, int? loopEnd = null)
+    public static ushort[] ReadPans(ReadOnlySpan<byte> data)
+    {
+        int count = ChannelCount(data);
+        if (data.Length < HeaderSize + count * ChannelSize) throw new InvalidDataException("The BWAV ends inside its header.");
+        ushort[] pans = new ushort[count];
+        for (int c = 0; c < count; c++) pans[c] = BinaryPrimitives.ReadUInt16LittleEndian(data[(HeaderSize + c * ChannelSize + 2)..]);
+        return pans;
+    }
+
+    public static BwavCodec Codec(ReadOnlySpan<byte> data)
+    {
+        Require(data);
+        if (ChannelCount(data) == 0) throw new InvalidDataException("The BWAV has no channels.");
+        return (BwavCodec)BinaryPrimitives.ReadUInt16LittleEndian(data[HeaderSize..]);
+    }
+
+    public static int SamplesInFile(ReadOnlySpan<byte> data)
+    {
+        Require(data);
+        return ChannelCount(data) == 0 ? 0 : (int)BinaryPrimitives.ReadUInt32LittleEndian(data[(HeaderSize + 0x0C)..]);
+    }
+
+    public static byte[] MakeStub(ReadOnlySpan<byte> full)
+    {
+        Require(full);
+        int count = ChannelCount(full);
+        int headerSize = HeaderSize + ChannelSize * count;
+        if (full.Length < headerSize) throw new InvalidDataException("The BWAV ends inside its header.");
+
+        byte[] stub = full[..headerSize].ToArray();
+        BinaryPrimitives.WriteUInt16LittleEndian(stub.AsSpan(0x0C), 0);
+        for (int c = 0; c < count; c++)
+        {
+            int at = HeaderSize + c * ChannelSize;
+            BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(at + 0x0C), 0);
+            BinaryPrimitives.WriteUInt32LittleEndian(stub.AsSpan(at + 0x34), (uint)Align(headerSize, 0x40));
+        }
+        return stub;
+    }
+
+    private static ushort[] PansFor(int count, ushort[]? pans)
+    {
+        if (pans is null) return Pans(count);
+        if (pans.Length != count) throw new ArgumentException($"{pans.Length} speaker positions given for {count} channels", nameof(pans));
+        return pans;
+    }
+
+    private static (int Samples, int? LoopStart, int? LoopEnd) CheckInput(short[][] channels, int? loopStart, int? loopEnd)
     {
         if (channels.Length == 0 || channels[0].Length == 0) throw new InvalidDataException("No audio samples to encode");
         int samples = channels[0].Length;
@@ -164,6 +210,18 @@ public static class Bwav
 
         if (loopEnd is { } e && e > samples) loopEnd = samples;
         if (loopStart is null || loopEnd is null || loopStart >= loopEnd) (loopStart, loopEnd) = (null, null);
+        return (samples, loopStart, loopEnd);
+    }
+
+    /// <summary>
+    /// Encodes PCM to a whole (non-prefetch) DSP-ADPCM BWAV. The loop is dropped unless it is a non-empty range;
+    /// an end past the audio is cut back to its end.
+    /// </summary>
+    public static byte[] Build(short[][] channels, int sampleRate, int? loopStart = null, int? loopEnd = null, ushort[]? pans = null)
+    {
+        int samples;
+        (samples, loopStart, loopEnd) = CheckInput(channels, loopStart, loopEnd);
+        ushort[] channelPans = PansFor(channels.Length, pans);
 
         var encoded = channels.AsParallel().AsOrdered().Select(c => DspAdpcmEncoder.Encode(c)).ToArray();
 
@@ -180,7 +238,6 @@ public static class Bwav
         uint crc = 0;
         foreach (var (_, adpcm) in encoded) crc = Crc32.Update(crc, adpcm);
 
-        ushort[] pans = Pans(channels.Length);
         int total = offsets[^1] + encoded[^1].Data.Length;
         byte[] output = new byte[total];
         "BWAV"u8.CopyTo(output);
@@ -195,7 +252,7 @@ public static class Bwav
             Span<byte> info = output.AsSpan(HeaderSize + c * ChannelSize, ChannelSize);
             var (coefs, adpcm) = encoded[c];
             BinaryPrimitives.WriteUInt16LittleEndian(info, (ushort)BwavCodec.DspAdpcm);
-            BinaryPrimitives.WriteUInt16LittleEndian(info[2..], pans[c]);
+            BinaryPrimitives.WriteUInt16LittleEndian(info[2..], channelPans[c]);
             BinaryPrimitives.WriteUInt32LittleEndian(info[4..], (uint)sampleRate);
             BinaryPrimitives.WriteUInt32LittleEndian(info[8..], (uint)samples);
             BinaryPrimitives.WriteUInt32LittleEndian(info[0x0C..], (uint)samples);
@@ -211,16 +268,141 @@ public static class Bwav
         return output;
     }
 
+    public const int OpusSampleRate = 48000;
+
+    public const int OpusBitrate = 64000;
+
+    private const int OpusFrame = 960;
+
+    public static byte[] BuildOpus(short[][] channels, int sampleRate, int? loopStart = null, int? loopEnd = null, ushort[]? pans = null, int bitrate = OpusBitrate)
+    {
+        CheckInput(channels, loopStart, loopEnd);
+        if (sampleRate != OpusSampleRate)
+        {
+            channels = [.. channels.Select(c => Resample(c, sampleRate, OpusSampleRate))];
+            int? Scale(int? at) => at is { } v ? (int)Math.Round(v * (double)OpusSampleRate / sampleRate) : null;
+            (loopStart, loopEnd) = (Scale(loopStart), loopEnd == 0x7FFFFFFF ? loopEnd : Scale(loopEnd));
+        }
+
+        int samples;
+        (samples, loopStart, loopEnd) = CheckInput(channels, loopStart, loopEnd);
+        ushort[] channelPans = PansFor(channels.Length, pans);
+        byte[][] encoded = channels.AsParallel().AsOrdered().Select(c => EncodeOpusChannel(c, bitrate)).ToArray();
+
+        int headerSize = HeaderSize + ChannelSize * channels.Length;
+        int[] offsets = new int[encoded.Length];
+        int position = Align(headerSize, 0x40);
+        for (int i = 0; i < encoded.Length; i++)
+        {
+            offsets[i] = position;
+            position = Align(position + encoded[i].Length, 0x40);
+        }
+
+        uint crc = 0;
+        foreach (byte[] chunk in encoded) crc = Crc32.Update(crc, chunk);
+
+        byte[] output = new byte[offsets[^1] + encoded[^1].Length];
+        "BWAV"u8.CopyTo(output);
+        BinaryPrimitives.WriteUInt16LittleEndian(output.AsSpan(4), 0xFEFF);
+        BinaryPrimitives.WriteUInt16LittleEndian(output.AsSpan(6), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(output.AsSpan(8), crc);
+        BinaryPrimitives.WriteUInt16LittleEndian(output.AsSpan(0x0E), (ushort)channels.Length);
+        for (int c = 0; c < encoded.Length; c++)
+        {
+            Span<byte> info = output.AsSpan(HeaderSize + c * ChannelSize, ChannelSize);
+            BinaryPrimitives.WriteUInt16LittleEndian(info, (ushort)BwavCodec.Opus);
+            BinaryPrimitives.WriteUInt16LittleEndian(info[2..], channelPans[c]);
+            BinaryPrimitives.WriteUInt32LittleEndian(info[4..], OpusSampleRate);
+            BinaryPrimitives.WriteUInt32LittleEndian(info[8..], (uint)samples);
+            BinaryPrimitives.WriteUInt32LittleEndian(info[0x0C..], (uint)samples);
+            BinaryPrimitives.WriteUInt32LittleEndian(info[0x30..], (uint)offsets[c]);
+            BinaryPrimitives.WriteUInt32LittleEndian(info[0x34..], (uint)offsets[c]);
+            BinaryPrimitives.WriteUInt32LittleEndian(info[0x38..], 1);
+            BinaryPrimitives.WriteInt32LittleEndian(info[0x3C..], loopEnd ?? -1);
+            BinaryPrimitives.WriteInt32LittleEndian(info[0x40..], loopStart ?? 0);
+            encoded[c].CopyTo(output, offsets[c]);
+        }
+        return output;
+    }
+
+    private static byte[] EncodeOpusChannel(short[] pcm, int bitrate)
+    {
+        IOpusEncoder encoder = OpusCodecFactory.CreateEncoder(OpusSampleRate, 1, OpusApplication.OPUS_APPLICATION_RESTRICTED_LOWDELAY);
+        encoder.Bitrate = bitrate;
+        encoder.UseVBR = true;
+        encoder.Complexity = 10;
+        encoder.SignalType = OpusSignal.OPUS_SIGNAL_MUSIC;
+        int skip = encoder.Lookahead;
+
+        short[] padded = new short[(pcm.Length + skip + OpusFrame - 1) / OpusFrame * OpusFrame];
+        pcm.CopyTo(padded, 0);
+
+        using MemoryStream body = new();
+        byte[] packet = new byte[1275];
+        Span<byte> head = stackalloc byte[8];
+        for (int at = 0; at < padded.Length; at += OpusFrame)
+        {
+            int size = encoder.Encode(padded.AsSpan(at, OpusFrame), OpusFrame, packet, packet.Length);
+            if (size <= 0) throw new InvalidOperationException($"The Opus encoder failed ({size}).");
+            BinaryPrimitives.WriteUInt32BigEndian(head, (uint)size);
+            BinaryPrimitives.WriteUInt32BigEndian(head[4..], encoder.FinalRange);
+            body.Write(head);
+            body.Write(packet, 0, size);
+        }
+
+        byte[] output = new byte[8 + 0x18 + 8 + body.Length];
+        Span<byte> o = output;
+        BinaryPrimitives.WriteUInt32LittleEndian(o, 0x80000001);
+        BinaryPrimitives.WriteUInt32LittleEndian(o[4..], 0x18);
+        o[9] = 1;
+        BinaryPrimitives.WriteUInt32LittleEndian(o[0x0C..], OpusSampleRate);
+        BinaryPrimitives.WriteUInt32LittleEndian(o[0x10..], 0x20);
+        BinaryPrimitives.WriteUInt32LittleEndian(o[0x1C..], (uint)skip);
+        BinaryPrimitives.WriteUInt32LittleEndian(o[0x20..], 0x80000004);
+        BinaryPrimitives.WriteUInt32LittleEndian(o[0x24..], (uint)body.Length);
+        body.ToArray().CopyTo(output, 0x28);
+        return output;
+    }
+
+    public static short[] Resample(short[] input, int from, int to)
+    {
+        if (from == to) return input;
+        int length = (int)Math.Round(input.Length * (double)to / from);
+        IResampler resampler = ResamplerFactory.CreateResampler(1, from, to, 10);
+        resampler.SkipZeroes();
+
+        short[] source = new short[input.Length + resampler.InputLatency + 1];
+        input.CopyTo(source, 0);
+        short[] output = new short[length];
+        int read = 0, written = 0;
+        while (read < source.Length && written < length)
+        {
+            int inLength = source.Length - read, outLength = length - written;
+            resampler.Process(0, source.AsSpan(read), ref inLength, output.AsSpan(written), ref outLength);
+            if (inLength == 0 && outLength == 0) break;
+            read += inLength;
+            written += outLength;
+        }
+        return output;
+    }
+
+    public const int OpusPrefetchTail = 240;
+
     /// <summary>
     /// A prefetch clip (the first 0x3800 samples of each channel) made from a whole BWAV. The header, coefficients,
     /// sample count and CRC stay those of the whole sound; only the data is cut, at a frame boundary.
     /// </summary>
-    public static byte[] MakePrefetch(ReadOnlySpan<byte> full)
+    public static byte[] MakePrefetch(ReadOnlySpan<byte> full, int? samples = null)
     {
         Require(full);
+        if (samples is <= 0) throw new ArgumentOutOfRangeException(nameof(samples), "A prefetch clip needs at least one sample.");
         int count = BinaryPrimitives.ReadUInt16LittleEndian(full[0x0E..]);
-        if (BinaryPrimitives.ReadUInt16LittleEndian(full[HeaderSize..]) != (ushort)BwavCodec.DspAdpcm)
-            throw new InvalidDataException("Only DSP-ADPCM BWAVs can be turned into prefetch clips");
+        var codec = (BwavCodec)BinaryPrimitives.ReadUInt16LittleEndian(full[HeaderSize..]);
+        if (codec == BwavCodec.Opus)
+            return MakeOpusPrefetch(full, samples ?? throw new ArgumentException("An Opus prefetch clip needs its length (take it from the clip being replaced).", nameof(samples)));
+        if (codec != BwavCodec.DspAdpcm)
+            throw new InvalidDataException("Only DSP-ADPCM and Opus BWAVs can be turned into prefetch clips");
+        int prefetchSamples = samples ?? PrefetchSamples;
         int headerSize = HeaderSize + ChannelSize * count;
 
         byte[] header = full[..headerSize].ToArray();
@@ -235,7 +417,7 @@ public static class Bwav
             uint full0 = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(at + 8));
             int source = (int)BinaryPrimitives.ReadUInt32LittleEndian(full[(at + 0x34)..]);
 
-            int inFile = (int)Math.Min(full0, PrefetchSamples);
+            int inFile = (int)Math.Min(full0, (uint)prefetchSamples);
             int frames = (inFile + Dsp.FrameSamples - 1) / Dsp.FrameSamples;
             int bytes = frames * Dsp.FrameBytes;
 
@@ -249,6 +431,43 @@ public static class Bwav
         byte[] output = new byte[offsets[^1] + chunks[^1].Length];
         header.CopyTo(output, 0);
         for (int c = 0; c < count; c++) chunks[c].CopyTo(output, offsets[c]);
+        return output;
+    }
+
+    private static byte[] MakeOpusPrefetch(ReadOnlySpan<byte> full, int samples)
+    {
+        int count = ChannelCount(full);
+        int headerSize = HeaderSize + ChannelSize * count;
+        if (IsPrefetch(full)) throw new InvalidDataException("The BWAV is already a prefetch clip; make the clip from the whole sound.");
+
+        byte[] header = full[..headerSize].ToArray();
+        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(0x0C), 1);
+
+        short[][] blocks = new short[count][];
+        int[] offsets = new int[count];
+        int position = Align(headerSize, 0x40);
+        for (int c = 0; c < count; c++)
+        {
+            int at = HeaderSize + c * ChannelSize;
+            int whole = (int)BinaryPrimitives.ReadUInt32LittleEndian(full[(at + 0x0C)..]);
+            int source = (int)BinaryPrimitives.ReadUInt32LittleEndian(full[(at + 0x34)..]);
+            if (source < 0 || source >= full.Length) throw new InvalidDataException($"Channel {c} reaches past the end of the file.");
+            int stated = Math.Min(whole, samples);
+            blocks[c] = OpusChannel.Decode(full[source..], Math.Min(whole, stated + OpusPrefetchTail), dropPreSkip: false);
+            int tail = blocks[c].Length - stated;
+            BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(at + 0x0C), (uint)stated);
+            BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(at + 0x10), (uint)tail);
+            BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(at + 0x14), (uint)(position + stated * 2));
+            BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(at + 0x34), (uint)position);
+            offsets[c] = position;
+            position = Align(position + blocks[c].Length * 2, 0x40);
+        }
+
+        byte[] output = new byte[offsets[^1] + blocks[^1].Length * 2];
+        header.CopyTo(output, 0);
+        for (int c = 0; c < count; c++)
+            for (int i = 0; i < blocks[c].Length; i++)
+                BinaryPrimitives.WriteInt16LittleEndian(output.AsSpan(offsets[c] + i * 2), blocks[c][i]);
         return output;
     }
 

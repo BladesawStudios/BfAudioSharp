@@ -12,7 +12,7 @@ internal static class OpusChannel
     private const uint HeaderMagic = 0x80000001, DataMagic = 0x80000004;
 
     /// <summary>Decodes the channel's packets to at most <paramref name="samples"/> samples, after the stream's pre-skip.</summary>
-    public static short[] Decode(ReadOnlySpan<byte> data, int samples)
+    public static short[] Decode(ReadOnlySpan<byte> data, int samples, bool dropPreSkip = true)
     {
         if (data.Length < 8 || BinaryPrimitives.ReadUInt32LittleEndian(data) != HeaderMagic)
             throw new InvalidDataException("The Opus channel does not start with a header chunk.");
@@ -35,7 +35,7 @@ internal static class OpusChannel
         IOpusDecoder decoder = OpusCodecFactory.CreateDecoder(rate, 1);
         short[] result = new short[samples];
         short[] frame = new short[5760];
-        int produced = 0, toSkip = skip;
+        int produced = 0, toSkip = dropPreSkip ? skip : 0;
         byte[] packet = new byte[1275 + 8];
 
         while (position + 8 <= end && produced < samples)

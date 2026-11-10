@@ -210,7 +210,7 @@ public sealed class TotkBars
     /// swapped. Everything before the BWAV region keeps its place. Blocks are sized by the distance to the next one, so
     /// padding the original tool left is kept, and with nothing replaced the output is the input byte for byte.
     /// </summary>
-    public static byte[] Rebuild(ReadOnlySpan<byte> data, IReadOnlyDictionary<int, byte[]> replacements)
+    public static byte[] Rebuild(ReadOnlySpan<byte> data, IReadOnlyDictionary<int, byte[]> replacements, IReadOnlySet<int>? ownBlocks = null)
     {
         if (!IsBars(data)) throw new InvalidDataException("Not a BARS file");
 
@@ -240,18 +240,35 @@ public sealed class TotkBars
             blobs[order[i]] = data[order[i]..next].ToArray();
         }
 
+        bool[] own = new bool[count];
+        foreach (int index in replacements.Keys)
+            own[index] = ownBlocks?.Contains(index) == true
+                && Enumerable.Range(0, count).Any(j => j != index && bwavOffsets[j] == bwavOffsets[index]);
+
         // Entries that shared an original block share the new one.
-        foreach (var (index, blob) in replacements) blobs[bwavOffsets[index]] = blob;
+        foreach (var (index, blob) in replacements)
+            if (!own[index]) blobs[bwavOffsets[index]] = blob;
 
         // Untouched blocks keep their original (already aligned, padding-included) bytes; new ones get zero padding to 0x40.
-        Dictionary<int, int> newOffsets = [];
+        Dictionary<int, int> sharedAt = [];
+        int[] ownAt = new int[count];
         List<byte> region = [];
-        foreach (int offset in order)
+        void Place(byte[] blob, out int at)
         {
             int pad = (regionStart + region.Count + 0x3F) / 0x40 * 0x40 - (regionStart + region.Count);
             region.AddRange(new byte[pad]);
-            newOffsets[offset] = regionStart + region.Count;
-            region.AddRange(blobs[offset]);
+            at = regionStart + region.Count;
+            region.AddRange(blob);
+        }
+        foreach (int offset in order)
+        {
+            if (Enumerable.Range(0, count).Any(i => bwavOffsets[i] == offset && !own[i]))
+            {
+                Place(blobs[offset], out int at);
+                sharedAt[offset] = at;
+            }
+            for (int i = 0; i < count; i++)
+                if (own[i] && bwavOffsets[i] == offset) Place(replacements[i], out ownAt[i]);
         }
 
         byte[] output = new byte[regionStart + region.Count];
@@ -260,8 +277,34 @@ public sealed class TotkBars
         BinaryPrimitives.WriteUInt32LittleEndian(output.AsSpan(4), (uint)output.Length);
         for (int i = 0; i < count; i++)
             if (bwavOffsets[i] is not (-1 or 0))
-                BinaryPrimitives.WriteInt32LittleEndian(output.AsSpan(pairs + i * 8 + 4), newOffsets[bwavOffsets[i]]);
+                BinaryPrimitives.WriteInt32LittleEndian(output.AsSpan(pairs + i * 8 + 4), own[i] ? ownAt[i] : sharedAt[bwavOffsets[i]]);
         return output;
+    }
+
+    public static byte[]? BlockBytes(ReadOnlySpan<byte> data, int entryIndex)
+    {
+        int count = (int)U32(data, 0xC);
+        int pairs = 0x10 + count * 4;
+        int offset = S32(data, pairs + entryIndex * 8 + 4);
+        if (offset is -1 or 0) return null;
+        int next = data.Length;
+        for (int i = 0; i < count; i++)
+        {
+            int other = S32(data, pairs + i * 8 + 4);
+            if (other > offset && other < next) next = other;
+        }
+        return data[offset..next].ToArray();
+    }
+
+    public static bool SharesBlock(ReadOnlySpan<byte> data, int entryIndex)
+    {
+        int count = (int)U32(data, 0xC);
+        int pairs = 0x10 + count * 4;
+        int offset = S32(data, pairs + entryIndex * 8 + 4);
+        if (offset is -1 or 0) return false;
+        for (int i = 0; i < count; i++)
+            if (i != entryIndex && S32(data, pairs + i * 8 + 4) == offset) return true;
+        return false;
     }
 
     /// <summary>The raw BWAV offset of an entry in the pair table (-1 or 0 when it has none), even for an empty placeholder.</summary>
